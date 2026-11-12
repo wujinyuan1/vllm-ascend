@@ -35,6 +35,16 @@ on:
         required: false
         type: string
         default: 'main'
+      checkout_ref:
+        description: 'Ref to build from. Defaults to branch_ref. Presmoke builds pass refs/pull/<n>/merge so the PR changes land on top of the base branch, while tags still follow branch_ref.'
+        required: false
+        type: string
+        default: ''
+      image_repo_suffix:
+        description: 'Suffix appended to the image repository name (e.g. -presmoke). Tags are unchanged.'
+        required: false
+        type: string
+        default: ''
       schedule_tag_pattern:
         description: 'Pattern used for the schedule Docker tag'
         required: false
@@ -76,7 +86,7 @@ defaults:
     shell: bash -el {0}
 
 env:
-  SWR_REPO: ${{ inputs.swr_repo }}
+  SWR_REPO: ${{ inputs.swr_repo }}${{ inputs.image_repo_suffix }}
 
 jobs:
   build-push-digest:
@@ -111,7 +121,9 @@ jobs:
         fetch-depth: 0
         persist-credentials: false
         # Empty on tag pushes and PR events, so the default event ref is used.
-        ref: ${{ inputs.branch_ref }}
+        # checkout_ref overrides the source commit for presmoke builds while the
+        # tag pattern still comes from branch_ref.
+        ref: ${{ inputs.checkout_ref || inputs.branch_ref }}
 
     - name: Compute cache tag
       id: cache-tag
@@ -381,7 +393,7 @@ jobs:
           done
 
       - name: Dispatch quay.io sync
-        if: ${{ inputs.should_push }}
+        if: ${{ inputs.should_push && inputs.image_repo_suffix == '' }}
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.SYNC_TOOLS_TOKEN }}

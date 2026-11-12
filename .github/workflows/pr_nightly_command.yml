@@ -19,7 +19,7 @@ name: Handle /nightly Command
 
 on:
   repository_dispatch:
-    types: [nightly-command, weekly-command]
+    types: [nightly-command, weekly-command, presmoke-command]
 
 defaults:
   run:
@@ -41,6 +41,8 @@ jobs:
       test_cases: ${{ steps.resolve.outputs.test_cases }}
       branch: ${{ steps.resolve.outputs.branch }}
       is_authorized: ${{ steps.auth.outputs.is_authorized }}
+      image_repo_suffix: ${{ steps.resolve.outputs.image_repo_suffix }}
+      build_ref: ${{ steps.resolve.outputs.build_ref }}
       dispatch_a2: ${{ steps.resolve.outputs.dispatch_a2 }}
       dispatch_a3: ${{ steps.resolve.outputs.dispatch_a3 }}
       dispatch_a3_560t: ${{ steps.resolve.outputs.dispatch_a3_560t }}
@@ -217,7 +219,8 @@ jobs:
           echo "command=$COMMAND" >> "$GITHUB_OUTPUT"
 
           ALL_ARGS=$(echo "$ALL_ARGS" | xargs)
-          if [ -z "$ALL_ARGS" ]; then
+          # /presmoke only builds the presmoke images, so test names are optional.
+          if [ -z "$ALL_ARGS" ] && [ "$COMMAND" != "presmoke" ]; then
             gh api "repos/${{ github.event.client_payload.github.payload.repository.full_name }}/issues/${{ github.event.client_payload.github.payload.issue.number }}/comments" \
               -f body="[Bot]: \`/$COMMAND\` without test names will not dispatch. Please specify test names, e.g. \`/$COMMAND all\` or \`/$COMMAND test_custom_op\`." \
               --silent
@@ -233,6 +236,9 @@ jobs:
           NEXT_IS_BRANCH=0
           NEXT_IS_DOWNLOAD=0
           DOWNLOAD_PATH=""
+          NEXT_IS_IMAGE=0
+          IMAGE="smoke"
+          IMAGE_REPO_SUFFIX=""
           NEXT_IS_VLLM_REF=0
           NEXT_IS_GOOD_COMMIT=0
           NEXT_IS_BAD_COMMIT=0
@@ -273,6 +279,9 @@ jobs:
             elif [ "$NEXT_IS_DOWNLOAD" = "1" ]; then
               DOWNLOAD_PATH="$WORD"
               NEXT_IS_DOWNLOAD=0
+            elif [ "$NEXT_IS_IMAGE" = "1" ]; then
+              IMAGE="$WORD"
+              NEXT_IS_IMAGE=0
             elif [ "$PENDING_OPTION" = "--profile-start-after" ]; then
               PROFILE_OPTIONS_JSON=$(jq -c --arg value "$WORD" '.start_after = $value' <<< "$PROFILE_OPTIONS_JSON")
               PENDING_OPTION=""
@@ -314,6 +323,8 @@ jobs:
               PENDING_OPTION=""
             elif [ "$WORD" = "--branch" ]; then
               NEXT_IS_BRANCH=1
+            elif [ "$WORD" = "--image" ]; then
+              NEXT_IS_IMAGE=1
             elif [ "$WORD" = "--log-path" ]; then
               NEXT_IS_DOWNLOAD=1
             elif [ "$WORD" = "--vllm-ref" ]; then
@@ -412,13 +423,32 @@ jobs:
             exit 1
           fi
 
-          if [ -z "$TEST_CASES" ]; then
+          if [ -z "$TEST_CASES" ] && [ "$COMMAND" != "presmoke" ]; then
             gh api "repos/${{ github.event.client_payload.github.payload.repository.full_name }}/issues/${{ github.event.client_payload.github.payload.issue.number }}/comments" \
               -f body="[Bot]: \`/$COMMAND\` without test names will not dispatch. Please specify test names, e.g. \`/$COMMAND all\` or \`/$COMMAND test_custom_op\`." \
               --silent
             exit 1
           fi
 
+
+          if [ "$COMMAND" = "presmoke" ]; then
+            IMAGE="presmoke"
+            # /presmoke is build-only: it never dispatches the nightly test
+            # workflows. Tests run later via /nightly <test_cases> --image presmoke.
+            TEST_CASES=""
+          fi
+          case "$IMAGE" in
+            smoke) IMAGE_REPO_SUFFIX="" ;;
+            presmoke) IMAGE_REPO_SUFFIX="-presmoke" ;;
+            *)
+              echo "ERROR: --image must be 'smoke' or 'presmoke'"
+              exit 1
+              ;;
+          esac
+          if [ "$IMAGE" != "smoke" ] && [ "$COMMAND" != "nightly" ] && [ "$COMMAND" != "presmoke" ]; then
+            echo "ERROR: --image is supported only by nightly and presmoke commands"
+            exit 1
+          fi
 
           printf -v BISECT_ARGS_JSON \
             '{"good_commit":"%s","bad_commit":"%s","fail_confirm_retries":"%s","trial_timeout":"%s","barrier_timeout":"%s","no_verify_good":%s,"no_verify_bad":%s,"force_initial_build":%s}' \
@@ -434,6 +464,7 @@ jobs:
             echo "test_cases=$TEST_CASES"
             echo "branch=$BRANCH"
             echo "download_path=$DOWNLOAD_PATH"
+            echo "image_repo_suffix=$IMAGE_REPO_SUFFIX"
             echo "aop_enabled=$AOP_ENABLED"
             echo "profile_options_json=$PROFILE_OPTIONS_JSON"
             echo "vllm_ref=$VLLM_REF"
@@ -452,6 +483,22 @@ jobs:
           PR_NUMBER=$(gh api "$PR_URL" --jq '.number')
           echo "vllm_ascend_ref=$PR_SHA" >> "$GITHUB_OUTPUT"
           echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+          # /presmoke builds the images from a merge of the PR into its base
+          # branch, so the result contains both the PR changes and everything
+          # that landed on the base branch since the PR was opened. GitHub
+          # creates refs/pull/<n>/merge only when the PR is mergeable.
+          if [ "$COMMAND" = "presmoke" ]; then
+            MERGE_REF="refs/pull/${PR_NUMBER}/merge"
+            BASE_REPO='${{ github.event.client_payload.github.payload.repository.full_name }}'
+            if ! gh api "repos/$BASE_REPO/git/matching-refs/pull/$PR_NUMBER" --jq '.[].ref' | grep -qx "$MERGE_REF"; then
+              gh api "repos/$BASE_REPO/issues/$PR_NUMBER/comments" \
+                -f body="[Bot]: \`/presmoke\` builds from the PR merge commit, but \`${MERGE_REF}\` does not exist. This usually means the PR conflicts with its base branch; please resolve the conflicts and retry." \
+                --silent
+              exit 1
+            fi
+            echo "build_ref=$MERGE_REF" >> "$GITHUB_OUTPUT"
+          fi
 
           if [ "$TEST_CASES" = "all" ]; then
             if [ "$IS_A3_560T" = "true" ]; then
@@ -525,6 +572,7 @@ jobs:
             -f vllm_ascend_branch='${{ needs.authorize.outputs.branch }}' \
             -f request_id='${{ needs.authorize.outputs.pr_number }}' \
             -f skip_build_image=true \
+            -f image_repo_suffix='${{ needs.authorize.outputs.image_repo_suffix }}' \
             -f vllm_ascend_ref='${{ needs.authorize.outputs.vllm_ascend_ref }}' \
             -f aop_enabled='${{ needs.authorize.outputs.aop_enabled }}' \
             -f download_path="$DOWNLOAD_PATH" \
@@ -573,6 +621,7 @@ jobs:
             -f vllm_ascend_branch='${{ needs.authorize.outputs.branch }}' \
             -f request_id='${{ needs.authorize.outputs.pr_number }}' \
             -f skip_build_image=true \
+            -f image_repo_suffix='${{ needs.authorize.outputs.image_repo_suffix }}' \
             -f vllm_ascend_ref='${{ needs.authorize.outputs.vllm_ascend_ref }}' \
             -f aop_enabled='${{ needs.authorize.outputs.aop_enabled }}' \
             -f download_path="$DOWNLOAD_PATH" \
@@ -621,6 +670,7 @@ jobs:
             -f vllm_ascend_branch='${{ needs.authorize.outputs.branch }}' \
             -f request_id='${{ needs.authorize.outputs.pr_number }}' \
             -f skip_build_image=true \
+            -f image_repo_suffix='${{ needs.authorize.outputs.image_repo_suffix }}' \
             -f vllm_ascend_ref='${{ needs.authorize.outputs.vllm_ascend_ref }}' \
             -f aop_enabled='${{ needs.authorize.outputs.aop_enabled }}' \
             -f download_path="$DOWNLOAD_PATH" \
@@ -669,6 +719,7 @@ jobs:
             -f vllm_ascend_branch='${{ needs.authorize.outputs.branch }}' \
             -f request_id='${{ needs.authorize.outputs.pr_number }}' \
             -f skip_build_image=true \
+            -f image_repo_suffix='${{ needs.authorize.outputs.image_repo_suffix }}' \
             -f vllm_ascend_ref='${{ needs.authorize.outputs.vllm_ascend_ref }}' \
             -f aop_enabled='${{ needs.authorize.outputs.aop_enabled }}' \
             -f download_path="$DOWNLOAD_PATH" \
@@ -717,6 +768,7 @@ jobs:
             -f request_id='${{ needs.authorize.outputs.pr_number }}' \
             -f download_path="$DOWNLOAD_PATH" \
             -f skip_build_image=true \
+            -f image_repo_suffix='${{ needs.authorize.outputs.image_repo_suffix }}' \
             -f vllm_ascend_ref='${{ needs.authorize.outputs.vllm_ascend_ref }}' \
             -f aop_enabled='${{ needs.authorize.outputs.aop_enabled }}' \
             -f profile_options_json="$PROFILE_OPTIONS_JSON" \
@@ -726,6 +778,51 @@ jobs:
             --jq '.workflow_runs[0].id')
           echo "_310p_run_id=$_310P_RUN_ID" >> "$GITHUB_OUTPUT"
           echo "Dispatched Nightly-310P with test_cases='${{ needs.authorize.outputs.test_cases }}', branch='${{ needs.authorize.outputs.branch }}', vllm_ref='${{ needs.authorize.outputs.vllm_ref }}'"
+
+  presmoke-build:
+    name: Build presmoke image (${{ matrix.target }})
+    needs: [authorize]
+    if: needs.authorize.outputs.is_authorized == 'true' && needs.authorize.outputs.blocked != 'true' && needs.authorize.outputs.command == 'presmoke'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: a2
+            soc: '910b'
+            dockerfile: Dockerfile
+            suffix: ''
+          - target: a3
+            soc: 'a3'
+            dockerfile: Dockerfile.a3
+            suffix: a3
+          - target: '310p'
+            soc: '310p'
+            dockerfile: Dockerfile.310p
+            suffix: 310p
+          - target: a5
+            soc: '950'
+            dockerfile: Dockerfile.a5
+            suffix: a5
+    uses: ./.github/workflows/_schedule_nightly_pair_image_build.yaml
+    with:
+      target: ${{ matrix.target }}
+      os: ubuntu
+      soc: ${{ matrix.soc }}
+      dockerfile: ${{ matrix.dockerfile }}
+      suffix: ${{ matrix.suffix }}
+      vllm_ascend_branch: ${{ needs.authorize.outputs.branch }}
+      base_image_branch: ${{ needs.authorize.outputs.branch }}
+      build_type: 'full'
+      should_push: ${{ github.repository == 'vllm-project/vllm-ascend' }}
+      checkout_ref: ${{ needs.authorize.outputs.build_ref }}
+      image_repo_suffix: ${{ needs.authorize.outputs.image_repo_suffix }}
+    secrets:
+      SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
+      SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
+      SYNC_TOOLS_TOKEN: ${{ secrets.SYNC_TOOLS_TOKEN }}
 
   dispatch-weekly-a2:
     name: Trigger Weekly-A2

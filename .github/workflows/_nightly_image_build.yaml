@@ -55,6 +55,16 @@ on:
         type: string
         default: ''
         description: "Branch used to resolve the base image (nightly-<branch>). Defaults to vllm_ascend_branch. For PR verification builds, set to the target branch instead of the head SHA."
+      checkout_ref:
+        required: false
+        type: string
+        default: ''
+        description: "Ref to build from. Defaults to vllm_ascend_branch. Presmoke builds pass refs/pull/<n>/merge so the PR changes land on top of the base branch."
+      image_repo_suffix:
+        required: false
+        type: string
+        default: ''
+        description: "Suffix appended to the image repository name (e.g. -presmoke). Tags are unchanged."
       build_type:
         required: false
         type: string
@@ -195,7 +205,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          ref: ${{ inputs.vllm_ascend_branch }}
+          ref: ${{ inputs.checkout_ref || inputs.vllm_ascend_branch }}
 
       - name: Record source commit
         if: ${{ inputs.should_push }}
@@ -236,7 +246,7 @@ jobs:
 
           # Runtime images are published by the runtime build workflow as
           # nightly-<branch>[-<target>][-openeuler] from the root Dockerfiles.
-          BASE_IMAGE="${{ inputs.swr_registry }}/ascend/vllm-ascend"
+          BASE_IMAGE="${{ inputs.swr_registry }}/ascend/vllm-ascend${{ inputs.image_repo_suffix }}"
           OS_MARK=""
           if [ "${{ matrix.os }}" = "openeuler" ]; then
             OS_MARK="-openeuler"
@@ -261,13 +271,13 @@ jobs:
             # full builds are published to the CI repo and to atlas_inference
             # (mirrored to swr.cn-north-4); openEuler only to atlas_inference.
             if [ -n "$OS_MARK" ]; then
-              FINAL_IMAGE="${{ inputs.swr_registry }}/atlas_inference/vllm-ascend:${FULL_TAG}"
+              FINAL_IMAGE="${{ inputs.swr_registry }}/atlas_inference/vllm-ascend${{ inputs.image_repo_suffix }}:${FULL_TAG}"
             else
-              FINAL_IMAGE="${{ inputs.swr_registry }}/base_image/ascend-ci/vllm-ascend:${FULL_TAG}, ${{ inputs.swr_registry }}/atlas_inference/vllm-ascend:${FULL_TAG}"
+              FINAL_IMAGE="${{ inputs.swr_registry }}/base_image/ascend-ci/vllm-ascend${{ inputs.image_repo_suffix }}:${FULL_TAG}, ${{ inputs.swr_registry }}/atlas_inference/vllm-ascend${{ inputs.image_repo_suffix }}:${FULL_TAG}"
             fi
             PUSH_IMAGE="${{ inputs.swr_registry }}/atlas_ci/vllm-atlas-temp:${UNIQUE_TAG}-${{ matrix.arch_name }}"
           else
-            FINAL_IMAGE="${{ inputs.swr_registry }}/base_image/ascend-ci/vllm-ascend:${FULL_TAG}"
+            FINAL_IMAGE="${{ inputs.swr_registry }}/base_image/ascend-ci/vllm-ascend${{ inputs.image_repo_suffix }}:${FULL_TAG}"
             PUSH_IMAGE="${FINAL_IMAGE}"
           fi
 
@@ -343,14 +353,14 @@ jobs:
               TAG_SUFFIX="${TAG_SUFFIX_OPENEULER}"
               # openEuler nightly images only live in the release-shaped repo
               # that the sync-tools workflow mirrors to swr.cn-north-4.
-              DESTS="${SWR_REGISTRY}/atlas_inference/vllm-ascend"
+              DESTS="${SWR_REGISTRY}/atlas_inference/vllm-ascend${{ inputs.image_repo_suffix }}"
             else
               OS_MARK=""
               TAG_SUFFIX="${TAG_SUFFIX_UBUNTU}"
               # ubuntu nightly images serve the CI contract (test workflows
               # pull from ascend-ci) and the north-4 consumers through the
               # atlas_inference mirror, matching the retired daily pipeline.
-              DESTS="${SWR_REGISTRY}/base_image/ascend-ci/vllm-ascend ${SWR_REGISTRY}/atlas_inference/vllm-ascend"
+              DESTS="${SWR_REGISTRY}/base_image/ascend-ci/vllm-ascend${{ inputs.image_repo_suffix }} ${SWR_REGISTRY}/atlas_inference/vllm-ascend${{ inputs.image_repo_suffix }}"
             fi
             TAG="nightly-ci-${BRANCH_TAG}-${TARGET}${OS_MARK}"
             # The build step pushed the per-arch images under the unique tag.
@@ -403,7 +413,7 @@ jobs:
           echo "merged=${MERGED_VARIANT}" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch cn-north-4 sync
-        if: ${{ steps.merge.outputs.merged == '1' && github.repository == 'vllm-project/vllm-ascend' }}
+        if: ${{ steps.merge.outputs.merged == '1' && github.repository == 'vllm-project/vllm-ascend' && inputs.image_repo_suffix == '' }}
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.SYNC_TOOLS_TOKEN }}
